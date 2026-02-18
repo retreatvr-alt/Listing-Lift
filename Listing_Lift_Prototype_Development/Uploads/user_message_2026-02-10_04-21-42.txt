@@ -1,0 +1,248 @@
+Now I have everything I need. Here's my full recommendation and the exact code changes for DeepAgent:
+
+---
+
+## Recommendation: Option 1 + Option 2 Hybrid
+
+**Replace `heic2any` with [`heic-to`](https://github.com/hoppergee/heic-to)** — and add a graceful fallback UX if conversion still fails.
+
+Here's why:
+
+| Factor | heic2any (current) | heic-to (recommended) |
+|---|---|---|
+| libheif version | **Ancient** (causes the `ERR_LIBHEIF format not supported` error) | **1.21.2** (latest, supports modern iPhone H.265 HEIC) |
+| Bundle size | ~2.7 MB | Smaller |
+| Maintenance | Stale, v0.0.4 for 3+ years | Actively tracks libheif releases |
+| Browser API | Similar | Simpler: `heicTo({ blob, type, quality })` |
+| H.265 / HEVC | ❌ Broken | ✅ Built with `libde265` (open-source H.265 decoder) |
+
+This solves the desktop HEIC problem because `heic-to` bundles a modern `libde265` WASM decoder that handles the exact codec (`H.265`) your console errors are complaining about. And if for any edge case it still fails, we show a helpful message instead of a broken preview.
+
+**Also remove sharp and the `/api/convert-heic` route** — they're dead code in production.
+
+---
+
+## Exact Code Changes for DeepAgent
+
+### Change 1: Replace heic2any with heic-to (package.json)
+
+Tell DeepAgent:
+```
+Run the following commands:
+  yarn remove heic2any sharp @types/sharp
+  yarn add heic-to
+```
+
+---
+
+### Change 2: Rewrite `convertHeicToJpeg` in `photo-uploader.tsx`
+
+Replace the entire `convertHeicToJpeg` function with:
+
+```tsx
+// Convert HEIC to JPEG using heic-to library (uses libheif 1.21.2 with H.265 support)
+const convertHeicToJpeg = async (file: File): Promise<{ blob: Blob; preview: string; success: boolean }> => {
+  try {
+    const heicTo = (await import('heic-to')).default;
+    const outputBlob = await heicTo({
+      blob: file,
+      type: 'image/jpeg',
+      quality: 0.9
+    });
+    
+    // heicTo can return Blob or Blob[]
+    const blob = Array.isArray(outputBlob) ? outputBlob[0] : outputBlob;
+    const preview = URL.createObjectURL(blob);
+    return { blob, preview, success: true };
+  } catch (error) {
+    console.error('[HEIC] Conversion failed:', error);
+    return { blob: file, preview: '', success: false };
+  }
+};
+```
+
+---
+
+### Change 3: Update `handleFiles` in `photo-uploader.tsx` to use converted file AND handle failure gracefully
+
+Replace the HEIC branch inside the `for` loop (the `if (isHeicFile(file))` block) with:
+
+```tsx
+if (isHeicFile(file)) {
+  const converted = await convertHeicToJpeg(file);
+  setConvertingCount(prev => Math.max(0, prev - 1));
+  
+  if (converted.success) {
+    // Use converted JPEG for both preview AND upload
+    preview = converted.preview;
+    fileToUse = new File(
+      [converted.blob],
+      file.name.replace(/\.heic$/i, '.jpg').replace(/\.heif$/i, '.jpg'),
+      { type: 'image/jpeg' }
+    );
+    orientation = await checkOrientation(converted.blob);
+  } else {
+    // Conversion failed - skip this file and alert the user
+    failedHeicFiles.push(file.name);
+    continue;
+  }
+} else {
+  preview = URL.createObjectURL(file);
+  fileToUse = file;
+  orientation = await checkOrientation(file);
+}
+```
+
+And you need to add the supporting variables. The full rewritten `handleFiles` function should be:
+
+```tsx
+const handleFiles = useCallback(async (files: FileList) => {
+  const validTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];
+  const filesToProcess: File[] = [];
+
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const fileExt = file.name?.split('.').pop()?.toLowerCase();
+    const isValidType = validTypes.includes(file?.type?.toLowerCase() || '') || 
+                        fileExt === 'heic' || fileExt === 'heif';
+    if (!isValidType) continue;
+    if (photos.length + filesToProcess.length >= maxPhotos) break;
+    filesToProcess.push(file);
+  }
+
+  // Count HEIC files for loading indicator
+  const heicCount = filesToProcess.filter(isHeicFile).length;
+  if (heicCount > 0) {
+    setConvertingCount(heicCount);
+  }
+
+  const newPhotos: PhotoFile[] = [];
+  const failedHeicFiles: string[] = [];
+
+  for (let i = 0; i < filesToProcess.length; i++) {
+    const file = filesToProcess[i];
+    
+    let preview: string;
+    let fileToUse: File;
+    let orientation: 'landscape' | 'portrait';
+
+    if (isHeicFile(file)) {
+      const converted = await convertHeicToJpeg(file);
+      setConvertingCount(prev => Math.max(0, prev - 1));
+      
+      if (converted.success) {
+        preview = converted.preview;
+        fileToUse = new File(
+          [converted.blob],
+          file.name.replace(/\.heic$/i, '.jpg').replace(/\.heif$/i, '.jpg'),
+          { type: 'image/jpeg' }
+        );
+        orientation = await checkOrientation(converted.blob);
+      } else {
+        failedHeicFiles.push(file.name);
+        continue;
+      }
+    } else {
+      preview = URL.createObjectURL(file);
+      fileToUse = file;
+      orientation = await checkOrientation(file);
+    }
+
+    newPhotos.push({
+      id: `${Date.now()}-${i}`,
+      file: fileToUse,
+      preview,
+      caption: '',
+      subCategory: subcategories?.[0] || undefined,
+      orientation,
+      fileName: file.name
+    });
+  }
+
+  setConvertingCount(0);
+  onPhotosChange([...photos, ...newPhotos]);
+
+  // Show user-friendly error for failed HEIC files
+  if (failedHeicFiles.length > 0) {
+    alert(
+      `${failedHeicFiles.length} HEIC file(s) could not be converted:\n${failedHeicFiles.join(', ')}\n\n` +
+      `Tip: On your iPhone, go to Settings → Camera → Formats → "Most Compatible" to save photos as JPEG instead. ` +
+      `Or use a free online converter like heictojpg.com before uploading.`
+    );
+  }
+}, [photos, onPhotosChange, maxPhotos, subcategories]);
+```
+
+---
+
+### Change 4: Delete `/app/api/convert-heic/route.ts`
+
+Tell DeepAgent:
+```
+Delete the file /app/api/convert-heic/route.ts entirely. 
+Server-side HEIC conversion via sharp does not work in production 
+(the libheif plugin is not compiled in). All conversion now happens 
+client-side via heic-to.
+```
+
+---
+
+### Change 5: Fix S3 ContentDisposition (if not already done from V2)
+
+In `lib/s3.ts`, in the `generatePresignedUploadUrl` function, change:
+```ts
+ContentDisposition: isPublic ? "attachment" : undefined,
+```
+to:
+```ts
+ContentDisposition: isPublic ? "inline" : undefined,
+```
+
+And in `getFileUrl`, change:
+```ts
+ResponseContentDisposition: "attachment",
+```
+to:
+```ts
+ResponseContentDisposition: "inline",
+```
+
+---
+
+### Change 6: Fix admin sidebar thumbnails (if not already done from V2)
+
+In the admin page, wherever sidebar thumbnails use `photo.originalUrl` directly as `img src`, change:
+```tsx
+src={photo.enhancedUrl || photo.originalUrl}
+```
+to:
+```tsx
+src={
+  (photo.enhancedUrl || photo.originalUrl)?.startsWith('http')
+    ? (photo.enhancedUrl || photo.originalUrl)
+    : `/api/file-url?path=${encodeURIComponent(photo.enhancedUrl || photo.originalUrl)}`
+}
+```
+
+---
+
+### Summary for DeepAgent
+
+| # | Action | File |
+|---|--------|------|
+| 1 | `yarn remove heic2any sharp @types/sharp && yarn add heic-to` | package.json |
+| 2 | Replace `convertHeicToJpeg` to use `heic-to` | photo-uploader.tsx |
+| 3 | Rewrite `handleFiles` to use converted file for upload + graceful failure UX | photo-uploader.tsx |
+| 4 | Delete file entirely | /app/api/convert-heic/route.ts |
+| 5 | Change `"attachment"` → `"inline"` in both functions | lib/s3.ts |
+| 6 | Fix sidebar thumbnail src resolution | admin/submissions/[id]/page.tsx |
+
+The key fix is **Change 2** — `heic-to` bundles libheif 1.21.2 with the `libde265` H.265 decoder compiled to WASM, which is exactly what's missing from heic2any 0.0.4. This will handle modern iPhone HEIC files from desktop uploads.
+
+Sources:
+- [heic-to on GitHub](https://github.com/hoppergee/heic-to)
+- [heic-to on npm](https://www.npmjs.com/package/heic-to)
+- [libheif-js on npm](https://www.npmjs.com/package/libheif-js)
+- [heic2any vs heic-convert comparison](https://npm-compare.com/heic-convert,heic2any)
+- [npm trends: heic-convert vs heic2any vs libheif-js](https://npmtrends.com/heic-convert-vs-heic2any-vs-libheif-js)
+- [Handling HEIC on the web - Upside](https://upsidelab.io/blog/handling-heic-on-the-web)

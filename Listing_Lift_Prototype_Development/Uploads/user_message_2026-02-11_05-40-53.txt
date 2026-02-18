@@ -1,0 +1,497 @@
+Here's your complete copy-paste for DeepAgent — all issues addressed in one message:
+
+---
+
+## FIX: Cropped Photos, Quality Regression, CORS Errors, and Enhancement History
+
+### Problems to Fix
+
+1. **Enhanced photos are cropped/zoomed-in** — The `resizeImageToAirbnb` function uses `fit: "cover"` which crops the image to fill exact dimensions. If the API returns anything slightly different from 3:2, content gets cut off. Even at exact 3:2, upscaling from 1536×1024 → 3000×2000 with `cover` can shift the crop center.
+
+2. **Quality went down** — Upscaling from 1536×1024 to 3000×2000 (~2x) using the default sharp resize kernel softens details. Need to use `lanczos3` kernel and add post-resize sharpening to maintain crispness.
+
+3. **CORS errors still appearing** — The cleanup route only clears `Photo.enhancedUrl` but NOT the `EnhancementVersion.enhancedUrl` records. Old EnhancementVersion records still point to Abacus AI's external S3 bucket (`abacusai-apps-92d1307...`), and the browser tries to load these when resolving URLs. The cleanup also needs to handle EnhancementVersion records.
+
+4. **No enhancement history viewer** — User wants to browse past enhancement versions, see what settings/prompt were used, compare them, and download individual versions.
+
+---
+
+### CHANGE 1: Fix `resizeImageToAirbnb` in `/lib/s3.ts`
+
+Find the entire `resizeImageToAirbnb` function and replace it with this version. The key changes are:
+- Uses `fit: "inside"` instead of `fit: "cover"` so NOTHING gets cropped
+- Then extends/pads to exact Airbnb dimensions with white background (so dimensions are exact)
+- Actually, since gpt-image-1.5 outputs at 1536x1024 (already 3:2), the best approach is to just resize to target without cropping. We use `fit: "fill"` which stretches to exact dimensions — but since the aspect ratio already matches (3:2 → 3:2), there's no visible distortion
+- Uses `lanczos3` kernel for sharpest possible upscale
+- Adds post-resize sharpening to counteract upscale softness
+- Bumps JPEG quality to 95
+
+Find this function:
+
+```typescript
+export async function resizeImageToAirbnb(
+```
+
+Replace the ENTIRE function (from `export async function resizeImageToAirbnb` through its closing `}`) with:
+
+```typescript
+/**
+ * Resize an image buffer to exact Airbnb dimensions using sharp.
+ * Standard: 3000x2000 (landscape) or 2000x3000 (portrait)
+ * Hero: 4000x2667 (landscape) or 2667x4000 (portrait)
+ * 
+ * Uses "inside" fit so nothing gets cropped, then extends to exact dimensions.
+ * Applies lanczos3 kernel for sharpest upscale and post-resize sharpening.
+ */
+export async function resizeImageToAirbnb(
+  inputBuffer: Buffer,
+  orientation: string,
+  isHero: boolean
+): Promise<Buffer> {
+  let targetWidth: number;
+  let targetHeight: number;
+
+  if (isHero) {
+    targetWidth = orientation === "portrait" ? 2667 : 4000;
+    targetHeight = orientation === "portrait" ? 4000 : 2667;
+  } else {
+    targetWidth = orientation === "portrait" ? 2000 : 3000;
+    targetHeight = orientation === "portrait" ? 3000 : 2000;
+  }
+
+  // Get the input image dimensions to decide strategy
+  const metadata = await sharp(inputBuffer).metadata();
+  const inputWidth = metadata.width || 1536;
+  const inputHeight = metadata.height || 1024;
+  const inputRatio = inputWidth / inputHeight;
+  const targetRatio = targetWidth / targetHeight;
+
+  // If aspect ratios match closely (within 2%), just resize directly — no crop needed
+  const ratioMatch = Math.abs(inputRatio - targetRatio) / targetRatio < 0.02;
+
+  let pipeline = sharp(inputBuffer);
+
+  if (ratioMatch) {
+    // Aspect ratios match — direct resize, no cropping
+    pipeline = pipeline.resize(targetWidth, targetHeight, {
+      fit: "fill",            // Stretch to exact dimensions (no visible distortion since ratios match)
+      kernel: "lanczos3",     // Sharpest resize kernel
+    });
+  } else {
+    // Aspect ratios don't match — resize to fit inside, then pad with white to reach exact dimensions
+    pipeline = pipeline.resize(targetWidth, targetHeight, {
+      fit: "inside",          // Scale to fit within bounds, no cropping
+      kernel: "lanczos3",
+      withoutEnlargement: false,
+    }).extend({
+      top: 0,
+      bottom: 0,
+      left: 0,
+      right: 0,
+      background: { r: 255, g: 255, b: 255 },
+    });
+    // After inside+extend, we need to ensure exact dimensions
+    pipeline = pipeline.resize(targetWidth, targetHeight, {
+      fit: "contain",
+      background: { r: 255, g: 255, b: 255 },
+      kernel: "lanczos3",
+    });
+  }
+
+  // Apply post-resize sharpening to counteract upscale softness
+  pipeline = pipeline.sharpen({
+    sigma: 0.8,       // Subtle sharpening radius
+    m1: 1.0,          // Flat area sharpening
+    m2: 0.7,          // Edge sharpening (slightly less to avoid halos)
+  });
+
+  const resized = await pipeline
+    .jpeg({
+      quality: 95,          // Higher quality to preserve detail after upscale
+      mozjpeg: true,        // Better compression
+      chromaSubsampling: '4:4:4',  // No chroma subsampling for maximum color accuracy
+    })
+    .toBuffer();
+
+  return resized;
+}
+```
+
+---
+
+### CHANGE 2: Fix the cleanup route `/app/api/admin/cleanup-stale-urls/route.ts`
+
+Replace the ENTIRE file content with this version that also cleans up `EnhancementVersion` records:
+
+```typescript
+import { NextResponse } from "next/server";
+import { prisma } from "@/lib/db";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth-options";
+
+export const dynamic = "force-dynamic";
+
+export async function POST() {
+  const session = await getServerSession(authOptions);
+  if (!session) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // 1. Clear Photo records with external URLs as enhancedUrl
+  const photoResult = await prisma.photo.updateMany({
+    where: {
+      enhancedUrl: { startsWith: "http" }
+    },
+    data: {
+      enhancedUrl: null,
+      status: "Pending"
+    }
+  });
+
+  // 2. Delete EnhancementVersion records that point to external URLs
+  // These cause CORS errors when the UI tries to resolve them
+  const versionResult = await prisma.enhancementVersion.deleteMany({
+    where: {
+      enhancedUrl: { startsWith: "http" }
+    }
+  });
+
+  // 3. Also clean up any Photo heroUrl that points to external URLs
+  const heroResult = await prisma.photo.updateMany({
+    where: {
+      heroUrl: { startsWith: "http" }
+    },
+    data: {
+      heroUrl: null
+    }
+  });
+
+  console.log(`[CLEANUP] Photos cleared: ${photoResult.count}, Versions deleted: ${versionResult.count}, Hero URLs cleared: ${heroResult.count}`);
+
+  return NextResponse.json({ 
+    photosCleared: photoResult.count,
+    versionsDeleted: versionResult.count,
+    heroUrlsCleared: heroResult.count,
+    message: `Cleared ${photoResult.count} photo URLs, deleted ${versionResult.count} stale enhancement versions, cleared ${heroResult.count} hero URLs` 
+  });
+}
+```
+
+---
+
+### CHANGE 3: Add Enhancement History section to admin page `/app/admin/submissions/[id]/page.tsx`
+
+This adds a collapsible "Enhancement History" section that shows all past enhancement versions for the selected photo, with the settings used, the prompt, a thumbnail preview, and a download button.
+
+#### 3A. Update the `EnhancementVersion` interface in the `Photo` interface
+
+Find the `enhancementVersions` type inside the `Photo` interface and replace it to include all the fields we store:
+
+Find:
+```typescript
+  enhancementVersions: Array<{
+    id: string;
+    versionNumber: number;
+    enhancedUrl: string;
+    intensity: string;
+    createdAt: string;
+  }>;
+```
+
+Replace with:
+```typescript
+  enhancementVersions: Array<{
+    id: string;
+    versionNumber: number;
+    enhancedUrl: string;
+    intensity: string;
+    skyReplacement: boolean;
+    bedFixing: boolean;
+    windowRecovery: boolean;
+    brightness: boolean;
+    perspective: boolean;
+    reflection: boolean;
+    additionalNotes?: string;
+    createdAt: string;
+  }>;
+```
+
+#### 3B. Add the `History` icon import
+
+Find the lucide-react import line and add `History` and `Clock` to it:
+
+Find:
+```typescript
+import { 
+  Loader2, ArrowLeft, User, Mail, Phone, MapPin, FileText, 
+  Camera, CheckCircle, XCircle, X, RotateCcw, Star, Download, 
+  ChevronLeft, ChevronRight, Sliders, Send, Archive
+} from "lucide-react";
+```
+
+Replace with:
+```typescript
+import { 
+  Loader2, ArrowLeft, User, Mail, Phone, MapPin, FileText, 
+  Camera, CheckCircle, XCircle, X, RotateCcw, Star, Download, 
+  ChevronLeft, ChevronRight, Sliders, Send, Archive, History, Clock
+} from "lucide-react";
+```
+
+#### 3C. Add `showHistory` state variable
+
+Find the line:
+```typescript
+  const [showPromptEditor, setShowPromptEditor] = useState(false);
+```
+
+Add this line right after it:
+```typescript
+  const [showHistory, setShowHistory] = useState(false);
+```
+
+#### 3D. Add the Enhancement History section in the JSX
+
+Find the closing `</div>` of the "Enhancement controls" card (it's the `</div>` right before the `{/* Photo actions */}` comment). Add this entire new section BETWEEN the Enhancement controls card and the Photo actions card:
+
+Insert this BEFORE `{/* Photo actions */}`:
+
+```jsx
+                {/* Enhancement History */}
+                {selectedPhoto.enhancementVersions && selectedPhoto.enhancementVersions.length > 0 && (
+                  <div className="bg-white rounded-xl shadow-md p-4">
+                    <button
+                      onClick={() => setShowHistory(!showHistory)}
+                      className="w-full flex items-center justify-between"
+                    >
+                      <h3 className="font-semibold text-[#383D31] flex items-center gap-2">
+                        <History className="w-4 h-4" /> Enhancement History ({selectedPhoto.enhancementVersions.length})
+                      </h3>
+                      <ChevronRight className={`w-4 h-4 text-gray-400 transition-transform ${showHistory ? 'rotate-90' : ''}`} />
+                    </button>
+                    
+                    {showHistory && (
+                      <div className="mt-4 space-y-3">
+                        {selectedPhoto.enhancementVersions.map((version) => {
+                          const versionUrl = getResolvedUrl(version.enhancedUrl);
+                          const activeToggles = [
+                            version.skyReplacement && 'Sky',
+                            version.bedFixing && 'Bed',
+                            version.windowRecovery && 'Window',
+                            version.brightness && 'Brightness',
+                            version.perspective && 'Perspective',
+                            version.reflection && 'Reflection',
+                          ].filter(Boolean);
+                          
+                          return (
+                            <div key={version.id} className="border border-gray-200 rounded-lg p-3">
+                              <div className="flex gap-3">
+                                {/* Thumbnail */}
+                                <div className="w-24 h-16 bg-gray-100 rounded overflow-hidden flex-shrink-0">
+                                  {versionUrl ? (
+                                    <img
+                                      src={versionUrl}
+                                      alt={`Version ${version.versionNumber}`}
+                                      className="w-full h-full object-cover cursor-pointer hover:opacity-80"
+                                      onClick={() => setLightboxUrl(versionUrl)}
+                                    />
+                                  ) : (
+                                    <div className="w-full h-full flex items-center justify-center text-gray-400">
+                                      <Camera className="w-4 h-4" />
+                                    </div>
+                                  )}
+                                </div>
+                                
+                                {/* Details */}
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center justify-between">
+                                    <span className="text-sm font-medium text-[#383D31]">
+                                      Version {version.versionNumber}
+                                    </span>
+                                    <div className="flex items-center gap-1">
+                                      {/* Use as current */}
+                                      <button
+                                        onClick={async () => {
+                                          try {
+                                            await fetch(`/api/photos/${selectedPhoto.id}`, {
+                                              method: 'PATCH',
+                                              headers: { 'Content-Type': 'application/json' },
+                                              body: JSON.stringify({ enhancedUrl: version.enhancedUrl, status: 'Enhanced' })
+                                            });
+                                            setSelectedPhoto(prev => prev ? { ...prev, enhancedUrl: version.enhancedUrl, status: 'Enhanced' } : null);
+                                            await fetchSubmission();
+                                          } catch (err) {
+                                            console.error('Failed to set version:', err);
+                                          }
+                                        }}
+                                        className="text-xs px-2 py-1 bg-[#383D31] text-white rounded hover:bg-[#2a2e24]"
+                                        title="Use this version as the current enhanced photo"
+                                      >
+                                        Use
+                                      </button>
+                                      {/* Download */}
+                                      {versionUrl && (
+                                        <a
+                                          href={versionUrl}
+                                          download={`${selectedPhoto.caption}-v${version.versionNumber}.jpg`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="text-xs px-2 py-1 bg-gray-100 text-gray-700 rounded hover:bg-gray-200"
+                                          title="Download this version"
+                                        >
+                                          <Download className="w-3 h-3" />
+                                        </a>
+                                      )}
+                                    </div>
+                                  </div>
+                                  
+                                  <div className="flex items-center gap-2 mt-1">
+                                    <span className={`text-xs px-1.5 py-0.5 rounded ${
+                                      version.intensity === 'Light' ? 'bg-green-100 text-green-700' :
+                                      version.intensity === 'Moderate' ? 'bg-blue-100 text-blue-700' :
+                                      'bg-purple-100 text-purple-700'
+                                    }`}>
+                                      {version.intensity}
+                                    </span>
+                                    {activeToggles.length > 0 && (
+                                      <span className="text-xs text-gray-500">
+                                        +{activeToggles.join(', ')}
+                                      </span>
+                                    )}
+                                  </div>
+                                  
+                                  <div className="flex items-center gap-1 mt-1 text-xs text-gray-400">
+                                    <Clock className="w-3 h-3" />
+                                    {new Date(version.createdAt).toLocaleDateString()} {new Date(version.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                  </div>
+                                  
+                                  {version.additionalNotes && (
+                                    <p className="text-xs text-gray-500 mt-1 truncate" title={version.additionalNotes}>
+                                      Notes: {version.additionalNotes}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+```
+
+#### 3E. Also update the URL resolver to resolve EnhancementVersion URLs
+
+Find the `resolveUrls` function inside the `useEffect` that resolves S3 URLs (around line 126-145). We need to also resolve enhancement version URLs. Replace the entire `useEffect` block:
+
+Find:
+```typescript
+  // Resolve S3 URLs for all photos when submission loads
+  useEffect(() => {
+    if (!submission?.photos) return;
+    
+    const resolveUrls = async () => {
+      const urls: Record<string, string> = {};
+      for (const photo of submission.photos) {
+        if (photo.originalUrl && !photo.originalUrl.startsWith('http')) {
+          const resolved = await getS3Url(photo.originalUrl);
+          if (resolved) urls[photo.originalUrl] = resolved;
+        }
+        if (photo.enhancedUrl && !photo.enhancedUrl.startsWith('http')) {
+          const resolved = await getS3Url(photo.enhancedUrl);
+          if (resolved) urls[photo.enhancedUrl] = resolved;
+        }
+      }
+      setResolvedUrls(prev => ({ ...prev, ...urls }));
+    };
+    
+    resolveUrls();
+  }, [submission]);
+```
+
+Replace with:
+```typescript
+  // Resolve S3 URLs for all photos and their enhancement versions when submission loads
+  useEffect(() => {
+    if (!submission?.photos) return;
+    
+    const resolveUrls = async () => {
+      const urls: Record<string, string> = {};
+      for (const photo of submission.photos) {
+        // Resolve original URL
+        if (photo.originalUrl && !photo.originalUrl.startsWith('http')) {
+          const resolved = await getS3Url(photo.originalUrl);
+          if (resolved) urls[photo.originalUrl] = resolved;
+        }
+        // Resolve enhanced URL
+        if (photo.enhancedUrl && !photo.enhancedUrl.startsWith('http')) {
+          const resolved = await getS3Url(photo.enhancedUrl);
+          if (resolved) urls[photo.enhancedUrl] = resolved;
+        }
+        // Resolve all enhancement version URLs (for history viewer)
+        if (photo.enhancementVersions) {
+          for (const version of photo.enhancementVersions) {
+            if (version.enhancedUrl && !version.enhancedUrl.startsWith('http') && !urls[version.enhancedUrl]) {
+              const resolved = await getS3Url(version.enhancedUrl);
+              if (resolved) urls[version.enhancedUrl] = resolved;
+            }
+          }
+        }
+      }
+      setResolvedUrls(prev => ({ ...prev, ...urls }));
+    };
+    
+    resolveUrls();
+  }, [submission]);
+```
+
+---
+
+### CHANGE 4: Update the comparison view aspect ratio to match 3:2
+
+The comparison panels currently use `aspect-[4/3]` but our enhanced photos are now 3:2. Update both the ORIGINAL and ENHANCED panels.
+
+Find every instance of:
+```
+aspect-[4/3]
+```
+
+Replace with:
+```
+aspect-[3/2]
+```
+
+There should be exactly 2 instances in the file — one for the ORIGINAL panel and one for the ENHANCED panel.
+
+---
+
+### CHANGE 5: Run the updated cleanup
+
+After deploying, run the cleanup again in the browser console. The updated cleanup now also handles EnhancementVersion records:
+
+```javascript
+fetch('/api/admin/cleanup-stale-urls', { method: 'POST', credentials: 'include' }).then(r => r.json()).then(console.log)
+```
+
+This will output how many Photo URLs were cleared, how many stale EnhancementVersion records were deleted, and how many hero URLs were cleared.
+
+---
+
+### SUMMARY
+
+| # | File | What Changed | Why |
+|---|---|---|---|
+| 1 | `/lib/s3.ts` | `resizeImageToAirbnb` uses `fill` (no crop) when ratios match, `contain` with white padding when they don't. Added `lanczos3` kernel, post-resize sharpening, JPEG quality 95 with `4:4:4` chroma | Fixes cropping/zoom issue and quality regression |
+| 2 | `/app/api/admin/cleanup-stale-urls/route.ts` | Also deletes stale `EnhancementVersion` records and clears stale `heroUrl` values | Fixes persistent CORS errors from old enhancement version URLs |
+| 3 | `/app/admin/submissions/[id]/page.tsx` | Added collapsible "Enhancement History" section with thumbnails, settings summary, "Use" button to revert to any version, download button, timestamps. Also resolves enhancement version URLs. Updated comparison panels to `aspect-[3/2]` | Enhancement history viewer + CORS fix for version URLs |
+| 4 | Database cleanup | Re-run cleanup after deploy | Clears remaining stale URLs causing CORS errors |
+
+### HOW ENHANCEMENT HISTORY WORKS
+
+- Every time you enhance a photo, a new `EnhancementVersion` record is created with the version number, enhanced URL, all settings (intensity, toggles), and additional notes
+- The "Enhancement History" section shows all versions for the selected photo in reverse chronological order
+- Each version shows: thumbnail preview (click to lightbox), version number, intensity level, active toggles, timestamp, and any notes
+- **"Use" button**: Sets that version's enhanced URL as the current photo's enhanced URL — lets you revert to any previous enhancement
+- **Download button**: Opens the enhanced image in a new tab for downloading
+- Enhancement versions are already being saved by the enhance route — this UI just surfaces them

@@ -1,0 +1,87 @@
+generator client {
+    provider = "prisma-client-js"
+    binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x"]
+    output = "/home/ubuntu/listing_lift/nextjs_space/node_modules/.prisma/client"
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+model AdminUser {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Submission {
+  id                    String    @id @default(cuid())
+  submissionNumber      String    @unique
+  homeownerName         String
+  email                 String
+  phone                 String
+  propertyAddress       String
+  city                  String?
+  provinceState         String?
+  postalZip             String?
+  notes                 String?
+  status                String    @default("New") // New, In Progress, Completed, Scheduled for Deletion
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  completedAt           DateTime?
+  deletionScheduledAt   DateTime?
+  photos                Photo[]
+  magicLinks            MagicLink[]
+}
+
+model Photo {
+  id                  String    @id @default(cuid())
+  submissionId        String
+  submission          Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  roomCategory        String    // Kitchen, Bedroom, Living Spaces, Bathroom, Pool/Hot Tub, Exterior
+  subCategory         String?   // Living Room, Dining Room/Dining Area, Building Exterior, Lawn/Backyard, Miscellaneous
+  caption             String    // Required 1-2 word label
+  originalUrl         String    // S3 cloud_storage_path
+  enhancedUrl         String?   // S3 cloud_storage_path
+  heroUrl             String?   // S3 cloud_storage_path for hero version
+  status              String    @default("Pending") // Pending, Enhanced, Approved, Rejected, Re-upload Requested
+  isHero              Boolean   @default(false)
+  orientation         String    @default("landscape") // landscape, portrait
+  rejectionReason     String?
+  reuploadInstructions String?
+  sortOrder           Int       @default(0)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  enhancementVersions EnhancementVersion[]
+}
+
+model EnhancementVersion {
+  id              String   @id @default(cuid())
+  photoId         String
+  photo           Photo    @relation(fields: [photoId], references: [id], onDelete: Cascade)
+  versionNumber   Int
+  enhancedUrl     String   // S3 cloud_storage_path
+  intensity       String   @default("Moderate") // Light, Moderate, Significant
+  skyReplacement  Boolean  @default(false)
+  bedFixing       Boolean  @default(false)
+  windowRecovery  Boolean  @default(false)
+  brightness      Boolean  @default(false)
+  perspective     Boolean  @default(false)
+  reflection      Boolean  @default(false)
+  additionalNotes String?
+  createdAt       DateTime @default(now())
+}
+
+model MagicLink {
+  id           String    @id @default(cuid())
+  token        String    @unique
+  submissionId String
+  submission   Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  expiresAt    DateTime
+  usedAt       DateTime?
+  createdAt    DateTime  @default(now())
+}

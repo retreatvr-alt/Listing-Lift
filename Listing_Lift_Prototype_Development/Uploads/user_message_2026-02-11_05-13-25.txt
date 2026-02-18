@@ -1,0 +1,953 @@
+There it is. The Abacus AI RouteLLM API has an `image_size` parameter inside `image_config` that maps directly to OpenAI's size values. This is the key.
+
+Now I have everything I need. The approach:
+1. Use `image_size: "1536x1024"` (which IS 3:2 natively) instead of `aspect_ratio: "3:2"` 
+2. Add `sharp` for post-processing to hit exact Airbnb pixel dimensions (3000×2000 standard, 4000×2667 hero)
+3. Generate hero versions at higher resolution
+
+Here's the complete merged message:
+
+---
+
+## ENHANCEMENT FIX — TIMEOUT + AIRBNB RESOLUTION (All Changes Merged)
+
+### Problem
+After changing aspect ratio from `4:3` to `3:2`, enhancements timeout at 90 seconds with 504 errors. The previous `aspect_ratio` string parameter was being interpreted differently by the RouteLLM routing layer. Additionally, enhanced photos need to meet exact Airbnb specifications:
+- **Standard photos**: 3000 × 2000 px (3:2)  
+- **Hero photos**: 4000 × 2667 px (3:2, higher resolution)
+
+### Root Cause
+The `image_config.aspect_ratio` parameter is a hint string that the RouteLLM layer interprets loosely. When set to `"3:2"`, the routing layer may attempt non-standard processing that causes timeouts. The Abacus AI RouteLLM API actually supports a separate `image_size` parameter that maps directly to exact OpenAI pixel dimensions — we should use that instead.
+
+### Solution
+1. Use `image_size: "1536x1024"` (which IS 3:2 natively at OpenAI) instead of `aspect_ratio`
+2. Use `quality: "high"` for best output from gpt-image-1.5
+3. Install `sharp` for server-side post-processing to upscale to exact Airbnb dimensions
+4. Generate hero versions at 4000×2667 when a photo is marked as hero
+5. Increase timeout to 150s and maxDuration to 180s
+
+---
+
+### CHANGE 1: Install `sharp`
+
+Run this command in the project:
+
+```bash
+npm install sharp
+```
+
+And add `@types/sharp` as a dev dependency:
+
+```bash
+npm install --save-dev @types/sharp
+```
+
+---
+
+### CHANGE 2: Add `uploadBufferToS3` and `resizeImageToAirbnb` to `/lib/s3.ts`
+
+Add these two functions at the bottom of `/lib/s3.ts` (after the existing `deleteFile` function). Also add the `sharp` import at the top of the file:
+
+Add this import at the TOP of the file alongside the existing AWS imports:
+
+```typescript
+import sharp from "sharp";
+```
+
+Then add these functions at the BOTTOM of the file:
+
+```typescript
+/**
+ * Upload a buffer directly to S3 (used for re-uploading enhanced images)
+ */
+export async function uploadBufferToS3(
+  buffer: Buffer,
+  fileName: string,
+  contentType: string
+): Promise<string> {
+  const timestamp = Date.now();
+  const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const cloud_storage_path = `${folderPrefix}public/enhanced/${timestamp}-${sanitizedFileName}`;
+
+  const command = new PutObjectCommand({
+    Bucket: bucketName,
+    Key: cloud_storage_path,
+    Body: buffer,
+    ContentType: contentType,
+    ContentDisposition: "inline",
+  });
+
+  await s3Client.send(command);
+  return cloud_storage_path;
+}
+
+/**
+ * Resize an image buffer to exact Airbnb dimensions using sharp.
+ * Standard: 3000x2000 (landscape) or 2000x3000 (portrait)
+ * Hero: 4000x2667 (landscape) or 2667x4000 (portrait)
+ * 
+ * Uses "cover" fit to fill exact dimensions (slight crop if needed to match 3:2),
+ * then outputs as high-quality JPEG.
+ */
+export async function resizeImageToAirbnb(
+  inputBuffer: Buffer,
+  orientation: string,
+  isHero: boolean
+): Promise<Buffer> {
+  let targetWidth: number;
+  let targetHeight: number;
+
+  if (isHero) {
+    targetWidth = orientation === "portrait" ? 2667 : 4000;
+    targetHeight = orientation === "portrait" ? 4000 : 2667;
+  } else {
+    targetWidth = orientation === "portrait" ? 2000 : 3000;
+    targetHeight = orientation === "portrait" ? 3000 : 2000;
+  }
+
+  const resized = await sharp(inputBuffer)
+    .resize(targetWidth, targetHeight, {
+      fit: "cover",       // Fill exact dimensions, crop minimally if needed
+      position: "center", // Center crop if aspect doesn't match exactly
+    })
+    .jpeg({
+      quality: 92,        // High quality, good file size balance
+      mozjpeg: true,      // Better compression algorithm
+    })
+    .toBuffer();
+
+  return resized;
+}
+```
+
+---
+
+### CHANGE 3: Replace entire `/app/api/photos/[id]/enhance/route.ts`
+
+Delete ALL content and replace with:
+
+```typescript
+import { NextResponse } from "next/server";
+import { prisma } from "@/lib/db";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth-options";
+import { ROOM_PROMPTS, INTENSITY_MODIFIERS } from "@/lib/enhancement-prompts";
+import { getFileUrl, uploadBufferToS3, resizeImageToAirbnb } from "@/lib/s3";
+
+export const dynamic = "force-dynamic";
+export const maxDuration = 180; // Allow up to 3 minutes for image generation + resize
+
+export async function POST(
+  request: Request,
+  { params }: { params: { id: string } }
+) {
+  const session = await getServerSession(authOptions);
+  if (!session) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  try {
+    const data = await request.json();
+    const {
+      intensity = "Moderate",
+      skyReplacement = false,
+      bedFixing = false,
+      windowRecovery = false,
+      brightness = false,
+      perspective = false,
+      reflection = false,
+      additionalNotes = "",
+      customPrompt = "",
+      addTowels = false,
+      smoothLinens = false,
+      addToiletPaper = false
+    } = data;
+
+    // Get photo with original URL
+    const photo = await prisma.photo.findUnique({
+      where: { id: params.id },
+      include: {
+        enhancementVersions: {
+          orderBy: { versionNumber: "desc" },
+          take: 1,
+        },
+      },
+    });
+
+    if (!photo) {
+      return NextResponse.json({ error: "Photo not found" }, { status: 404 });
+    }
+
+    // Mark photo as "Enhancing" so UI can show progress
+    await prisma.photo.update({
+      where: { id: params.id },
+      data: { status: "Enhancing" },
+    });
+
+    // Always use ORIGINAL photo URL, never the enhanced one
+    const originalUrl = await getFileUrl(photo.originalUrl, true);
+
+    // Build the prompt - use customPrompt if provided, otherwise build from templates
+    let prompt: string;
+
+    if (customPrompt && customPrompt.trim().length > 0) {
+      prompt = customPrompt.trim();
+    } else {
+      const roomKey = photo.subCategory || photo.roomCategory;
+      prompt = ROOM_PROMPTS[roomKey] || ROOM_PROMPTS[photo.roomCategory] || ROOM_PROMPTS["Kitchen"];
+      prompt += INTENSITY_MODIFIERS[intensity] || INTENSITY_MODIFIERS["Moderate"];
+
+      // Add enhancement toggles
+      const toggles: string[] = [];
+      if (skyReplacement) toggles.push("Replace the sky with a pleasant blue sky with natural clouds.");
+      if (bedFixing) toggles.push("Smooth and fix bed linens to appear crisp, clean, and hotel-quality.");
+      if (windowRecovery) toggles.push("Recover blown-out windows to reveal the exterior view.");
+      if (brightness) toggles.push("Increase overall brightness and open up shadow areas.");
+      if (perspective) toggles.push("Correct perspective distortion and straighten vertical lines.");
+      if (reflection) toggles.push("Remove photographer reflections from mirrors, glass, and screens.");
+
+      // Creative additions (opt-in only)
+      if (addTowels) toggles.push("Add fresh, neatly folded white towels if towels are missing or sparse.");
+      if (smoothLinens) toggles.push("Smooth bed linens and duvet to appear freshly made and wrinkle-free.");
+      if (addToiletPaper) toggles.push("Add a toilet paper roll if one is not visible.");
+
+      if (toggles.length > 0) {
+        prompt += `\n\nADDITIONAL SPECIFIC INSTRUCTIONS:\n${toggles.join("\n")}`;
+      }
+
+      if (additionalNotes) {
+        prompt += `\n\nADMIN NOTES:\n${additionalNotes}`;
+      }
+    }
+
+    console.log("[Enhancement] Starting for photo:", params.id);
+    console.log("[Enhancement] Model: gpt-image-1.5");
+    console.log("[Enhancement] Orientation:", photo.orientation);
+    console.log("[Enhancement] Is Hero:", photo.isHero);
+    console.log("[Enhancement] Prompt length:", prompt.length);
+
+    // Determine image_size for the API call
+    // gpt-image-1.5 via RouteLLM supports: "1024x1024", "1536x1024", "1024x1536"
+    // 1536x1024 = 3:2 landscape, 1024x1536 = 2:3 portrait
+    const imageSize = photo.orientation === "portrait" ? "1024x1536" : "1536x1024";
+
+    // AbortController for timeout (150 seconds)
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 150000);
+
+    try {
+      // Call Abacus AI with gpt-image-1.5 - synchronous JSON response, NOT streaming
+      const response = await fetch("https://apps.abacus.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.ABACUSAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-image-1.5",
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "image_url",
+                  image_url: { url: originalUrl },
+                },
+                {
+                  type: "text",
+                  text: prompt,
+                },
+              ],
+            },
+          ],
+          modalities: ["image"],
+          image_config: {
+            num_images: 1,
+            image_size: imageSize,
+            quality: "high",
+          },
+          max_tokens: 1000,
+        }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error("[Enhancement] API error:", response.status, errorText);
+        await prisma.photo.update({
+          where: { id: params.id },
+          data: { status: photo.status },
+        });
+        return NextResponse.json(
+          { error: `Enhancement API failed: ${response.status}` },
+          { status: 500 }
+        );
+      }
+
+      const result = await response.json();
+      console.log("[Enhancement] Response received, extracting image...");
+
+      // Extract enhanced image URL from response
+      let enhancedImageUrl = "";
+
+      // Primary: choices[0].message.content array (gpt-image-1.5 format)
+      const content = result?.choices?.[0]?.message?.content;
+      if (Array.isArray(content)) {
+        for (const item of content) {
+          if (item?.type === "image_url" && item?.image_url?.url) {
+            enhancedImageUrl = item.image_url.url;
+            break;
+          }
+        }
+      }
+
+      // Fallback: check .images property
+      if (!enhancedImageUrl) {
+        const images = result?.choices?.[0]?.message?.images;
+        if (images && images.length > 0) {
+          enhancedImageUrl = images[0]?.image_url?.url || images[0]?.url || "";
+        }
+      }
+
+      if (!enhancedImageUrl) {
+        console.error("[Enhancement] No image in response:", JSON.stringify(result).substring(0, 500));
+        await prisma.photo.update({
+          where: { id: params.id },
+          data: { status: photo.status },
+        });
+        return NextResponse.json(
+          { error: "No enhanced image returned from API" },
+          { status: 500 }
+        );
+      }
+
+      console.log("[Enhancement] Got enhanced image URL, downloading for resize...");
+
+      // Download the enhanced image
+      const imageResponse = await fetch(enhancedImageUrl);
+      if (!imageResponse.ok) {
+        throw new Error(`Failed to download enhanced image: ${imageResponse.status}`);
+      }
+      const rawBuffer = Buffer.from(await imageResponse.arrayBuffer());
+
+      // Resize to exact Airbnb dimensions using sharp
+      // Standard: 3000x2000 (landscape) or 2000x3000 (portrait)
+      // Hero: 4000x2667 (landscape) or 2667x4000 (portrait)
+      console.log("[Enhancement] Resizing to Airbnb dimensions (hero:", photo.isHero, ")...");
+      const standardBuffer = await resizeImageToAirbnb(rawBuffer, photo.orientation, false);
+
+      // Upload standard version to S3
+      const standardS3Key = await uploadBufferToS3(
+        standardBuffer,
+        `enhanced-${photo.id}.jpg`,
+        "image/jpeg"
+      );
+      console.log("[Enhancement] Standard version uploaded:", standardS3Key);
+
+      // If this is a hero photo, also generate the higher-res hero version
+      let heroS3Key: string | null = null;
+      if (photo.isHero) {
+        console.log("[Enhancement] Generating hero version (4000x2667)...");
+        const heroBuffer = await resizeImageToAirbnb(rawBuffer, photo.orientation, true);
+        heroS3Key = await uploadBufferToS3(
+          heroBuffer,
+          `hero-${photo.id}.jpg`,
+          "image/jpeg"
+        );
+        console.log("[Enhancement] Hero version uploaded:", heroS3Key);
+      }
+
+      // Save to database
+      const versionNumber =
+        (photo?.enhancementVersions?.[0]?.versionNumber || 0) + 1;
+
+      await prisma.enhancementVersion.create({
+        data: {
+          photoId: params.id,
+          versionNumber,
+          enhancedUrl: standardS3Key,
+          intensity,
+          skyReplacement,
+          bedFixing,
+          windowRecovery,
+          brightness,
+          perspective,
+          reflection,
+          additionalNotes: additionalNotes || null,
+        },
+      });
+
+      await prisma.photo.update({
+        where: { id: params.id },
+        data: {
+          enhancedUrl: standardS3Key,
+          ...(heroS3Key ? { heroUrl: heroS3Key } : {}),
+          status: "Enhanced",
+        },
+      });
+
+      console.log("[Enhancement] Complete! Version:", versionNumber);
+
+      return NextResponse.json({
+        status: "completed",
+        enhancedUrl: standardS3Key,
+        heroUrl: heroS3Key || null,
+        versionNumber,
+      });
+    } catch (abortError: unknown) {
+      clearTimeout(timeoutId);
+      if (abortError instanceof Error && abortError.name === "AbortError") {
+        console.error("[Enhancement] Timed out after 150 seconds");
+        await prisma.photo.update({
+          where: { id: params.id },
+          data: { status: photo.status },
+        });
+        return NextResponse.json(
+          { error: "Enhancement timed out after 150 seconds. Please try again — processing times can vary." },
+          { status: 504 }
+        );
+      }
+      throw abortError;
+    }
+  } catch (error) {
+    console.error("[Enhancement] Error:", error);
+    return NextResponse.json(
+      { error: "Enhancement failed" },
+      { status: 500 }
+    );
+  }
+}
+```
+
+---
+
+### CHANGE 4: Replace entire `/lib/enhancement-prompts.ts`
+
+Delete ALL content and replace with. These prompts use an editing/correction style optimized for gpt-image-1.5. Creative additions (towels, toilet paper) are NOT in the base prompts — they are opt-in checkboxes in the admin UI.
+
+```typescript
+export const ROOM_PROMPTS: Record<string, string> = {
+  Kitchen: `Edit this existing photo of a real kitchen in a vacation rental property. Keep the exact same scene, composition, objects, and details — do not add, remove, or change any items, furniture, fixtures, or architectural features. This is a real space that guests will visit, so accuracy is critical.
+
+Apply professional real estate photo editing:
+- Correct white balance so surfaces show their true colors
+- Even out lighting — brighten shadows, recover blown-out windows
+- Straighten vertical lines (cabinets, door frames, appliances)
+- Correct any wide-angle or perspective distortion from camera lens
+- Sharpen details on appliances, fixtures, and hardware
+- Stainless steel should look neutral and clean (not yellow or blue)
+- Wood surfaces should look warm with visible grain texture
+- Countertops and backsplash textures must remain natural and photorealistic
+- Ensure any text or labels remain legible and undistorted
+- The result should look like a professional photographer's edited RAW file, not AI-generated
+
+The viewer should not be able to tell this was edited with AI. Maintain 100% photorealistic quality.`,
+
+  Bedroom: `Edit this existing photo of a real bedroom in a vacation rental property. Keep the exact same scene, composition, objects, and details — do not add, remove, or change any items, furniture, or architectural features. This is a real space that guests will visit, so accuracy is critical.
+
+Apply professional real estate photo editing:
+- Correct white balance for accurate fabric and wall colors
+- Even out lighting — brighten dark corners, balance window light with interior
+- Straighten any tilted framing or perspective distortion
+- Recover exterior view through blown-out windows if applicable
+- Keep the exact same bed frame, headboard, pillows, and bedding style
+- Fabric textures should remain natural — cotton should look like cotton, not plastic
+- Enhance whites in linens to appear bright and clean without losing texture
+- Create warm, inviting ambiance with soft, natural-looking light
+- The result should look like a luxury hotel photo shoot, not AI-generated
+
+The viewer should not be able to tell this was edited with AI. Maintain 100% photorealistic quality.`,
+
+  "Living Room": `Edit this existing photo of a real living room in a vacation rental property. Keep the exact same scene, composition, objects, and details — do not add, remove, or change any items, furniture, or architectural features. This is a real space that guests will visit, so accuracy is critical.
+
+Apply professional real estate photo editing:
+- Correct white balance for accurate furniture and wall colors
+- Even out lighting — brighten shadows, balance windows with interior (HDR style)
+- Straighten vertical lines (walls, door frames, windows, furniture edges)
+- Correct wide-angle or perspective distortion
+- Remove photographer reflections from glass, mirrors, or TV screens
+- Recover exterior views through blown-out windows
+- Enhance natural light to emphasize spaciousness and openness
+- Fabric and upholstery textures should remain natural and photorealistic
+- Wood, leather, and metal surfaces should maintain their authentic appearance
+- The result should look like a professional interior photographer's edit
+
+The viewer should not be able to tell this was edited with AI. Maintain 100% photorealistic quality.`,
+
+  "Living Spaces": `Edit this existing photo of a real living space in a vacation rental property. Keep the exact same scene, composition, objects, and details — do not add, remove, or change any items, furniture, or architectural features. This is a real space that guests will visit, so accuracy is critical.
+
+Apply professional real estate photo editing:
+- Correct white balance for accurate colors throughout
+- Even out lighting — brighten shadows, balance windows with interior (HDR style)
+- Straighten vertical lines and correct perspective distortion
+- Remove photographer reflections from glass, mirrors, or screens
+- Recover exterior views through blown-out windows
+- Enhance natural light to emphasize spaciousness
+- All material textures should remain natural and photorealistic
+- The result should look like a professional photographer's edited RAW file
+
+The viewer should not be able to tell this was edited with AI. Maintain 100% photorealistic quality.`,
+
+  "Dining Room/Dining Area": `Edit this existing photo of a real dining area in a vacation rental property. Keep the exact same scene, composition, objects, and details — do not add, remove, or change any items, furniture, or architectural features. This is a real space that guests will visit, so accuracy is critical.
+
+Apply professional real estate photo editing:
+- Correct white balance for accurate surface and wall colors
+- Even out lighting — brighten shadows, balance windows with interior
+- Straighten vertical lines and correct perspective distortion
+- Remove photographer reflections from glass or mirrors
+- Enhance table surface appearance — wood grain should look natural and warm
+- Keep exact chair count, arrangement, and style
+- Enhance any chandelier or pendant lighting naturally
+- Create warm, welcoming ambiance for the dining space
+- The result should look like a professional interior photograph
+
+The viewer should not be able to tell this was edited with AI. Maintain 100% photorealistic quality.`,
+
+  Bathroom: `Edit this existing photo of a real bathroom in a vacation rental property. Keep the exact same scene, composition, objects, and details — do not add, remove, or change any fixtures or features. This is a real space that guests will visit, so accuracy is critical.
+
+Apply professional real estate photo editing:
+- Correct white balance for clean, neutral tones (not yellow or blue)
+- Brighten evenly throughout — eliminate dark corners and shadows
+- Straighten vertical lines (walls, door frames, shower doors)
+- Correct wide-angle distortion (bathrooms are often shot with 0.5x lens)
+- Remove photographer reflection from mirrors and glass surfaces
+- Tiles, grout, chrome, and porcelain should look spotlessly clean
+- Glass and mirrors should appear streak-free
+- Create bright, fresh, spa-like lighting mood
+- All fixture textures should remain photorealistic (chrome looks like chrome, tile looks like tile)
+- The result should look like a professional hotel bathroom photograph
+
+The viewer should not be able to tell this was edited with AI. Maintain 100% photorealistic quality.`,
+
+  "Pool/Hot Tub": `Edit this existing photo of a real pool or hot tub at a vacation rental property. Keep the exact same scene, composition, structures, and features — do not add, remove, or change any structures, furniture, or features. This is a real space that guests will visit, so accuracy is critical. Sky replacement IS allowed since it does not misrepresent the property.
+
+Apply professional real estate photo editing:
+- Correct white balance and even out lighting
+- Straighten any tilted framing and correct lens distortion
+- Enhance water to look crystal clear and inviting with natural blue/turquoise tones
+- If sky is overcast or gray, replace with a pleasant blue sky with natural clouds
+- Enhance deck/patio surfaces without changing materials
+- Do NOT add furniture, umbrellas, loungers, or pool items that are not present
+- All surfaces and textures should remain photorealistic
+- The result should look like a professional resort-quality photo
+
+The viewer should not be able to tell this was edited with AI. Maintain 100% photorealistic quality.`,
+
+  "Building Exterior": `Edit this existing photo of a real building exterior at a vacation rental property. Keep the exact same structure, architectural details, and features — do not add, remove, or change any architectural elements. This is a real property that guests will visit, so accuracy is critical. Sky replacement IS allowed since it does not misrepresent the property.
+
+Apply professional real estate photo editing:
+- Correct white balance and even out lighting across the facade
+- Straighten any tilted framing and correct perspective distortion
+- If sky is overcast or gray, replace with a pleasant blue sky with natural clouds
+- Enhance the appearance of existing siding, brick, stone, or stucco (do not change materials)
+- Brighten windows and doors without adding reflections
+- Enhance existing landscaping vibrancy naturally (not neon green)
+- Do NOT add landscaping, structures, or features that don't exist
+- All building materials should remain photorealistic
+- The result should look like a professional architectural photograph
+
+The viewer should not be able to tell this was edited with AI. Maintain 100% photorealistic quality.`,
+
+  Exterior: `Edit this existing photo of a real building exterior at a vacation rental property. Keep the exact same structure, architectural details, and features — do not add, remove, or change any architectural elements. This is a real property that guests will visit, so accuracy is critical. Sky replacement IS allowed since it does not misrepresent the property.
+
+Apply professional real estate photo editing:
+- Correct white balance and even out lighting
+- Straighten any tilted framing and correct perspective distortion
+- If sky is overcast or gray, replace with a pleasant blue sky
+- Enhance existing surfaces and landscaping naturally
+- Do NOT add features that don't exist
+- The result should look like a professional architectural photograph
+
+The viewer should not be able to tell this was edited with AI. Maintain 100% photorealistic quality.`,
+
+  "Lawn/Backyard": `Edit this existing photo of a real lawn or backyard at a vacation rental property. Keep the exact same scene, structures, and features — do not add pools, hot tubs, fire pits, pergolas, furniture, or any features that are not present. This is a real property that guests will visit, so accuracy is critical. Sky replacement IS allowed.
+
+Apply professional real estate photo editing:
+- Correct white balance and even out lighting
+- Straighten any tilted framing and correct lens distortion
+- If sky is overcast or gray, replace with a pleasant blue sky
+- Enhance grass vibrancy naturally (healthy green, not neon or artificial)
+- Brighten existing foliage and flowers appropriately
+- Enhance existing patio/deck surfaces without changing materials
+- Do NOT add furniture, umbrellas, staging items, or landscaping that aren't present
+- All textures should remain photorealistic
+- The result should look like a professional landscape photograph
+
+The viewer should not be able to tell this was edited with AI. Maintain 100% photorealistic quality.`,
+
+  Miscellaneous: `Edit this existing photo of a real exterior feature at a vacation rental property. Keep the exact same scene, structures, and features — do not add or remove anything. This is a real property that guests will visit, so accuracy is critical. Sky replacement IS allowed.
+
+Apply professional real estate photo editing:
+- Correct white balance and even out lighting
+- Straighten any tilted framing and correct lens distortion
+- If sky is overcast or gray, replace with a pleasant blue sky
+- Enhance surfaces to look clean and well-maintained without changing materials
+- All textures should remain photorealistic
+- The result should look like a professional property photograph
+
+The viewer should not be able to tell this was edited with AI. Maintain 100% photorealistic quality.`
+};
+
+export const INTENSITY_MODIFIERS: Record<string, string> = {
+  Light: `\n\nINTENSITY: LIGHT — Apply only subtle corrections, like a quick polish on a good photo:\n- Minor exposure adjustment (+/- 0.5 stops max)\n- Gentle white balance correction\n- Light shadow recovery\n- Subtle sharpening\n- Minor straightening if needed\nDo NOT apply sky replacement. Maintain maximum fidelity to the original.`,
+
+  Moderate: `\n\nINTENSITY: MODERATE — Apply standard professional corrections, like processing a RAW file:\n- Full exposure correction (+/- 1 stop)\n- White balance normalization\n- Shadow and highlight recovery\n- Perspective and distortion correction\n- Color vibrancy enhancement\n- Reflection removal if present\nApply sky replacement only if sky is significantly overcast or gray.`,
+
+  Significant: `\n\nINTENSITY: SIGNIFICANT — Apply comprehensive corrections for magazine-quality results:\n- Major exposure rebalancing\n- Full white balance correction\n- HDR-style shadow and highlight recovery\n- Sky replacement if overcast or blown out\n- Blown-out window recovery to reveal exterior views\n- Full perspective, angle, and distortion correction\n- Reflection removal\n- Resolution and sharpness enhancement\nNote: If original image has severe motion blur or is too dark to recover, the photo should be flagged for re-upload rather than enhanced.`
+};
+
+export const ROOM_TIPS: Record<string, { tips: string[] }> = {
+  Kitchen: {
+    tips: [
+      "First: Clear counters, take general layout shots",
+      "Shoot at chest height (6\" above counter)",
+      "Then: Stage with appliances, pots, pans for \"ready-to-cook\" shots",
+      "Include vent hood in cooking station shots",
+      "Open blinds for natural light",
+      "Remove magnets and papers from fridge"
+    ]
+  },
+  Bedroom: {
+    tips: [
+      "Focus on the bed as the main focal point",
+      "Shoot from the foot of the bed with clearance",
+      "Try \"shooting through\" a doorway for artistic depth",
+      "Ensure duvet is tucked in perfectly",
+      "Use 4+ king-size pillows for luxury hotel look",
+      "Add a throw blanket at foot of bed",
+      "Close closet doors and remove personal items"
+    ]
+  },
+  "Living Spaces": {
+    tips: [
+      "Shoot corner-to-corner to show three walls",
+      "Capture at knee-to-chest height (24-30 inches)",
+      "Use Rule of Thirds grid on phone",
+      "Stage with throw blankets, open books, plants",
+      "Fluff pillows and add a throw blanket",
+      "Remove visible cords and cables",
+      "Open all blinds and curtains"
+    ]
+  },
+  Bathroom: {
+    tips: [
+      "Use 0.5x wide-angle for tight spaces",
+      "Ensure camera is high enough to see top of counter",
+      "Shoot from doorway if space is very tight",
+      "Ensure spotless cleanliness throughout",
+      "Include fresh, fluffy towels (white preferred)",
+      "Make sure toilet paper is visible",
+      "Remove ALL personal toiletries",
+      "Keep toilet lid DOWN",
+      "Also upload: Laundry Room photos here"
+    ]
+  },
+  "Pool/Hot Tub": {
+    tips: [
+      "Use Foreground-Pool-Sky composition",
+      "Crystal clear water (clean before shooting!)",
+      "Stage with pool floats, rolled towels",
+      "Move colorful pool floaty around for multiple shots",
+      "Capture \"magic\" winter shots if in snowy area",
+      "Hot tub: show with cover off",
+      "Evening/twilight shots with lights on are excellent"
+    ]
+  },
+  Exterior: {
+    tips: [
+      "Capture from knee height for imposing look",
+      "Include generous amount of sky",
+      "Shoot front of house straight-on or at slight angle",
+      "Capture full structure if possible",
+      "Remove cars, toys, and trash cans from view",
+      "Clean driveway and walkways",
+      "Also upload: Sheds, Pathways, Driveways here"
+    ]
+  }
+};
+
+export const ROOM_CATEGORIES = [
+  { id: "Kitchen", name: "Kitchen", hasSubcategories: false },
+  { id: "Bedroom", name: "Bedroom", hasSubcategories: false },
+  { 
+    id: "Living Spaces", 
+    name: "Living Spaces", 
+    hasSubcategories: true,
+    subcategories: ["Living Room", "Dining Room/Dining Area", "Foyer/Entryway", "Home Theater", "Game Room"]
+  },
+  { id: "Bathroom", name: "Bathroom", hasSubcategories: false },
+  { id: "Pool/Hot Tub", name: "Pool/Hot Tub", hasSubcategories: false },
+  { 
+    id: "Exterior", 
+    name: "Exterior", 
+    hasSubcategories: true,
+    subcategories: ["Building Exterior", "Lawn/Backyard", "Miscellaneous"]
+  }
+];
+```
+
+---
+
+### CHANGE 5: Update the admin page `/app/admin/submissions/[id]/page.tsx`
+
+There are several changes to this file:
+
+#### 5A. Add import at top of file
+
+Add this import alongside the other imports at the top:
+
+```typescript
+import { ROOM_PROMPTS, INTENSITY_MODIFIERS } from "@/lib/enhancement-prompts";
+```
+
+#### 5B. Add new state variables
+
+Find the existing state declarations and ADD these new state variables after `resolvedUrls`:
+
+```typescript
+const [showPromptEditor, setShowPromptEditor] = useState(false);
+const [customPrompt, setCustomPrompt] = useState('');
+```
+
+Also UPDATE the `enhanceSettings` state to include the new creative addition fields. Find:
+
+```typescript
+const [enhanceSettings, setEnhanceSettings] = useState({
+    intensity: 'Moderate',
+    skyReplacement: false,
+    bedFixing: false,
+    windowRecovery: false,
+    brightness: false,
+    perspective: false,
+    reflection: false,
+    additionalNotes: ''
+  });
+```
+
+Replace with:
+
+```typescript
+const [enhanceSettings, setEnhanceSettings] = useState({
+    intensity: 'Moderate',
+    skyReplacement: false,
+    bedFixing: false,
+    windowRecovery: false,
+    brightness: false,
+    perspective: false,
+    reflection: false,
+    additionalNotes: '',
+    addTowels: false,
+    smoothLinens: false,
+    addToiletPaper: false
+  });
+```
+
+#### 5C. Add `buildCurrentPrompt` helper function
+
+Add this function AFTER the `getResolvedUrl` function (around line 159). This mirrors the server-side prompt construction exactly, so "Edit prompt" shows the ACTUAL prompt:
+
+```typescript
+const buildCurrentPrompt = (): string => {
+    if (!selectedPhoto) return '';
+    
+    const roomKey = selectedPhoto.subCategory || selectedPhoto.roomCategory;
+    let prompt = ROOM_PROMPTS[roomKey] || ROOM_PROMPTS[selectedPhoto.roomCategory] || ROOM_PROMPTS["Kitchen"];
+    prompt += INTENSITY_MODIFIERS[enhanceSettings.intensity] || INTENSITY_MODIFIERS["Moderate"];
+
+    const toggles: string[] = [];
+    if (enhanceSettings.skyReplacement) toggles.push("Replace the sky with a pleasant blue sky with natural clouds.");
+    if (enhanceSettings.bedFixing) toggles.push("Smooth and fix bed linens to appear crisp, clean, and hotel-quality.");
+    if (enhanceSettings.windowRecovery) toggles.push("Recover blown-out windows to reveal the exterior view.");
+    if (enhanceSettings.brightness) toggles.push("Increase overall brightness and open up shadow areas.");
+    if (enhanceSettings.perspective) toggles.push("Correct perspective distortion and straighten vertical lines.");
+    if (enhanceSettings.reflection) toggles.push("Remove photographer reflections from mirrors, glass, and screens.");
+    if (enhanceSettings.addTowels) toggles.push("Add fresh, neatly folded white towels if towels are missing or sparse.");
+    if (enhanceSettings.smoothLinens) toggles.push("Smooth bed linens and duvet to appear freshly made and wrinkle-free.");
+    if (enhanceSettings.addToiletPaper) toggles.push("Add a toilet paper roll if one is not visible.");
+
+    if (toggles.length > 0) {
+      prompt += `\n\nADDITIONAL SPECIFIC INSTRUCTIONS:\n${toggles.join('\n')}`;
+    }
+
+    if (enhanceSettings.additionalNotes) {
+      prompt += `\n\nADMIN NOTES:\n${enhanceSettings.additionalNotes}`;
+    }
+
+    return prompt;
+  };
+```
+
+#### 5D. Replace the `handleEnhance` function
+
+Find and replace the entire `handleEnhance` function with this simplified JSON-based version (no more streaming):
+
+```typescript
+const handleEnhance = async () => {
+    if (!selectedPhoto) return;
+    setEnhancing(true);
+
+    try {
+      const body: Record<string, unknown> = { ...enhanceSettings };
+      
+      // If the user edited the prompt, send it as customPrompt
+      if (showPromptEditor && customPrompt.trim()) {
+        body.customPrompt = customPrompt.trim();
+      }
+
+      const response = await fetch(`/api/photos/${selectedPhoto.id}/enhance`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+
+      const result = await response.json();
+
+      if (response.ok && result?.status === 'completed') {
+        // Update the selected photo immediately with new enhanced URL
+        setSelectedPhoto(prev => prev ? { ...prev, enhancedUrl: result.enhancedUrl, status: 'Enhanced' } : null);
+        // Then refresh full submission data
+        await fetchSubmission();
+      } else {
+        const errorMsg = result?.error || 'Enhancement failed';
+        alert(errorMsg);
+      }
+    } catch (error) {
+      console.error('Enhancement failed:', error);
+      alert('Enhancement failed. Please try again.');
+    } finally {
+      setEnhancing(false);
+      setShowPromptEditor(false);
+    }
+  };
+```
+
+#### 5E. Add Creative Additions checkboxes and Edit Prompt UI to the JSX
+
+In the Enhancement Settings section, find the toggles grid (the `<div className="grid grid-cols-2 md:grid-cols-3 gap-3">` block that contains skyReplacement, windowRecovery, brightness, bedFixing, perspective, reflection). 
+
+AFTER the closing `</div>` of that toggles grid, and BEFORE the existing "Additional notes" `<div>`, insert these two new sections:
+
+```jsx
+                    {/* Creative Additions */}
+                    <div>
+                      <label className="text-sm font-medium text-amber-700 mb-2 block">Creative Additions (opt-in)</label>
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                        {[
+                          { key: 'addTowels', label: 'Add Towels', hint: 'Bathroom' },
+                          { key: 'smoothLinens', label: 'Smooth Linens', hint: 'Bedroom' },
+                          { key: 'addToiletPaper', label: 'Add Toilet Paper', hint: 'Bathroom' },
+                        ].map(({ key, label, hint }) => (
+                          <label
+                            key={key}
+                            className="flex items-center gap-2 p-2 rounded-lg bg-amber-50 border border-amber-200 cursor-pointer hover:bg-amber-100"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={enhanceSettings[key as keyof typeof enhanceSettings] as boolean}
+                              onChange={(e) => setEnhanceSettings(prev => ({ ...prev, [key]: e.target.checked }))}
+                              className="rounded text-amber-600"
+                            />
+                            <div>
+                              <span className="text-sm">{label}</span>
+                              <span className="text-xs text-amber-600 ml-1">({hint})</span>
+                            </div>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Edit Prompt */}
+                    <div>
+                      <button
+                        onClick={() => {
+                          if (!showPromptEditor) {
+                            setCustomPrompt(buildCurrentPrompt());
+                          }
+                          setShowPromptEditor(!showPromptEditor);
+                        }}
+                        className="text-sm text-blue-600 hover:text-blue-800 underline"
+                      >
+                        {showPromptEditor ? 'Hide prompt editor' : 'Edit prompt'}
+                      </button>
+                      {showPromptEditor && (
+                        <div className="mt-2 space-y-2">
+                          <textarea
+                            value={customPrompt}
+                            onChange={(e) => setCustomPrompt(e.target.value)}
+                            className="w-full border border-blue-200 rounded-lg px-3 py-2 text-sm font-mono"
+                            rows={12}
+                            placeholder="Custom enhancement prompt..."
+                          />
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => setCustomPrompt(buildCurrentPrompt())}
+                              className="text-xs text-gray-500 hover:text-gray-700 underline"
+                            >
+                              Reset to current defaults
+                            </button>
+                            <span className="text-xs text-gray-400">|</span>
+                            <span className="text-xs text-gray-400">{customPrompt.length} chars</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+```
+
+#### 5F. Update the enhance button disabled state
+
+Find the enhance button and update its `disabled` prop to also check for `"Enhancing"` status:
+
+Find:
+```jsx
+disabled={enhancing}
+```
+
+Replace with:
+```jsx
+disabled={enhancing || selectedPhoto?.status === 'Enhancing'}
+```
+
+---
+
+### CHANGE 6: One-time stale URL cleanup
+
+Re-run the cleanup to clear any remaining stale external URLs from the database. Either hit the existing endpoint:
+
+```
+POST /api/admin/cleanup-stale-urls
+```
+
+Or run this SQL directly:
+
+```sql
+UPDATE "Photo" 
+SET "enhancedUrl" = NULL, "status" = 'Pending' 
+WHERE "enhancedUrl" IS NOT NULL 
+AND "enhancedUrl" LIKE 'http%';
+```
+
+---
+
+### SUMMARY OF ALL CHANGES
+
+| # | File | What Changed | Why |
+|---|---|---|---|
+| 1 | `package.json` | Install `sharp` and `@types/sharp` | Server-side image resize to exact Airbnb dimensions |
+| 2 | `/lib/s3.ts` | Added `uploadBufferToS3()` and `resizeImageToAirbnb()` | Re-upload to S3 (fixes CORS), resize to 3000×2000 standard or 4000×2667 hero |
+| 3 | `/app/api/photos/[id]/enhance/route.ts` | Complete rewrite | Uses `image_size` instead of `aspect_ratio` (fixes timeout), gpt-image-1.5 with `quality: "high"`, sharp resize to exact Airbnb px, hero version generation, 150s timeout |
+| 4 | `/lib/enhancement-prompts.ts` | Complete rewrite | Editing-style prompts optimized for gpt-image-1.5, room-specific texture hints, no creative additions in base prompts |
+| 5 | `/app/admin/submissions/[id]/page.tsx` | Multiple updates | JSON-based handleEnhance (no streaming), `buildCurrentPrompt()` so Edit Prompt shows actual prompt, creative addition checkboxes, auto-refresh after enhancement |
+| 6 | Database | One-time cleanup | Clear stale external URLs causing CORS errors |
+
+### HOW AIRBNB DIMENSIONS ARE ACHIEVED
+
+The pipeline is: **gpt-image-1.5 generates at 1536×1024 (3:2 native)** → **sharp upscales to 3000×2000 (standard) or 4000×2667 (hero)** → **uploaded to S3 as high-quality JPEG (92% quality, mozjpeg compression)**.
+
+This means:
+- Every enhanced photo is exactly **3000 × 2000 px** (3:2 aspect ratio) — Airbnb standard
+- Hero photos are also saved at **4000 × 2667 px** (3:2 aspect ratio) — Airbnb hero resolution
+- Portrait photos are **2000 × 3000** (standard) or **2667 × 4000** (hero)
+- The `image_size` parameter tells the API to generate at the correct 3:2 ratio natively, so the upscale is clean with no cropping needed
+- `sharp` with `mozjpeg` produces excellent quality at reasonable file sizes

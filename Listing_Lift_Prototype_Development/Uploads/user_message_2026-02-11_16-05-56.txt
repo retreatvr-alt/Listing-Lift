@@ -1,0 +1,246 @@
+Id like to get an email after photos have been submitted and the first round of enhancements have been completed (as this is usually when I would go in and make any necessary manual re-enhancements). Can you please tell me what the default enhancement settings would be for that first run (including default base prompts) for photos for all rooms.
+
+See claude code directions below:
+
+Good — prompts are confirmed as the editing-style versions we wrote. Now here's the answer to your question and the copy-paste for DeepAgent:
+
+---
+
+## Default First-Round Enhancement Settings
+
+Here's exactly what the auto-enhancement uses for every photo on first submission:
+
+**Model:** `gpt-image-1.5`
+**Intensity:** `Moderate`
+**All toggles OFF:** skyReplacement=false, bedFixing=false, windowRecovery=false, brightness=false, perspective=false, reflection=false, addTowels=false, smoothLinens=false, addToiletPaper=false
+**Prompt:** Room-specific base prompt (the "Edit this existing photo of a real [room]..." format) + Moderate intensity modifier
+**No additional notes or custom prompt**
+
+The Moderate intensity modifier adds:
+> Full exposure correction, white balance normalization, shadow and highlight recovery, perspective and distortion correction, color vibrancy enhancement, reflection removal if present. Apply sky replacement only if sky is significantly overcast or gray.
+
+So the first pass is a clean, middle-of-the-road edit with no creative additions. Then you go in and dial up specific toggles or edit the prompt for photos that need more work.
+
+---
+
+Now here's your copy-paste for DeepAgent:
+
+---
+
+## ADD: Admin Email Notification After Auto-Enhancement Completes
+
+### What This Does
+
+After a homeowner submits photos and the auto-enhancement finishes processing all of them, send an email to the admin (dan@retreatvr.ca) letting them know the first round of enhancements is ready for review. This is when the admin would go in and do any manual re-enhancements.
+
+Currently the system sends two emails on submission:
+1. Confirmation email to the homeowner
+2. "New Submission" alert to admin
+
+But there's no email after auto-enhancement finishes. Since auto-enhancement runs in the background and can take several minutes (each photo takes ~30-90 seconds with gpt-image-1.5), the admin has no way of knowing when it's done.
+
+---
+
+### CHANGE 1: Add a new email template to `/lib/email.ts`
+
+Add this new function at the bottom of the file, after the existing `generateMagicLinkEmail` function:
+
+```typescript
+export function generateAutoEnhanceCompleteEmail({
+  submissionNumber,
+  homeownerName,
+  propertyAddress,
+  totalPhotos,
+  successCount,
+  errorCount
+}: {
+  submissionNumber: string;
+  homeownerName: string;
+  propertyAddress: string;
+  totalPhotos: number;
+  successCount: number;
+  errorCount: number;
+}): string {
+  const allSuccess = errorCount === 0;
+  const statusColor = allSuccess ? '#22c55e' : '#f59e0b';
+  const statusText = allSuccess 
+    ? `All ${successCount} photos enhanced successfully` 
+    : `${successCount} of ${totalPhotos} photos enhanced (${errorCount} failed)`;
+
+  return `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+      <div style="background: #383D31; padding: 20px; text-align: center;">
+        <h1 style="color: #f9f7f4; margin: 0;">Listing Lift</h1>
+        <p style="color: #d4d1c8; margin: 8px 0 0 0;">Auto-Enhancement Complete</p>
+      </div>
+      <div style="padding: 30px; background: #f9f7f4;">
+        <h2 style="color: #383D31; margin-top: 0;">First Round Ready for Review</h2>
+        
+        <div style="background: white; border-radius: 8px; padding: 20px; margin: 20px 0; border-left: 4px solid ${statusColor};">
+          <p style="margin: 0 0 8px 0; font-size: 16px; font-weight: bold; color: ${statusColor};">${statusText}</p>
+          <p style="margin: 8px 0;"><strong>Submission:</strong> #${submissionNumber}</p>
+          <p style="margin: 8px 0;"><strong>Homeowner:</strong> ${homeownerName}</p>
+          <p style="margin: 8px 0;"><strong>Property:</strong> ${propertyAddress}</p>
+        </div>
+        
+        <div style="background: white; border-radius: 8px; padding: 15px; margin: 20px 0;">
+          <p style="margin: 0 0 8px 0; font-weight: bold; color: #383D31;">Default Settings Used:</p>
+          <ul style="color: #555; margin: 0; padding-left: 20px; line-height: 1.8;">
+            <li>Model: gpt-image-1.5</li>
+            <li>Intensity: Moderate</li>
+            <li>All toggles OFF (no sky replacement, bed fixing, etc.)</li>
+            <li>No creative additions (towels, toilet paper, etc.)</li>
+            <li>Room-specific editing prompts applied</li>
+            <li>Output: 3000×2000 px (Airbnb standard)</li>
+          </ul>
+        </div>
+
+        ${errorCount > 0 ? `
+        <div style="background: #fef3c7; border-radius: 8px; padding: 15px; margin: 20px 0; border-left: 4px solid #f59e0b;">
+          <p style="margin: 0; color: #92400e;"><strong>⚠️ ${errorCount} photo(s) failed to enhance.</strong> These can be manually enhanced from the dashboard.</p>
+        </div>
+        ` : ''}
+
+        <p style="color: #555; line-height: 1.6;">Review the enhancements in the dashboard. You can re-run any photo with different settings, toggle specific corrections, or edit the prompt for more control.</p>
+
+        <div style="text-align: center; margin: 30px 0;">
+          <a href="${process.env.NEXTAUTH_URL}/admin" style="background: #383D31; color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; display: inline-block;">Review Enhancements →</a>
+        </div>
+      </div>
+      <div style="background: #383D31; padding: 15px; text-align: center;">
+        <p style="color: #d4d1c8; margin: 0; font-size: 12px;">© ${new Date().getFullYear()} Retreat Vacation Rentals</p>
+      </div>
+    </div>
+  `;
+}
+```
+
+---
+
+### CHANGE 2: Update the auto-enhance route to send the email after completion
+
+File: `/app/api/submissions/[id]/auto-enhance/route.ts`
+
+**2A. Add the email imports at the top of the file.**
+
+Find:
+```typescript
+import { getFileUrl, uploadBufferToS3, resizeImageToAirbnb } from "@/lib/s3";
+```
+
+Add this line right after it:
+```typescript
+import { sendNotificationEmail, generateAutoEnhanceCompleteEmail } from "@/lib/email";
+```
+
+**2B. After the processing loop completes, fetch the submission details and send the email.**
+
+Find this block near the end of the function (around line 195-202):
+
+```typescript
+    console.log('[AUTO-ENHANCE] Completed. Success:', successCount, 'Errors:', errorCount);
+
+    return NextResponse.json({
+      status: 'completed',
+      total: photos.length,
+      success: successCount,
+      errors: errorCount
+    });
+```
+
+Replace it with:
+
+```typescript
+    console.log('[AUTO-ENHANCE] Completed. Success:', successCount, 'Errors:', errorCount);
+
+    // Send email notification to admin that auto-enhancement is complete
+    try {
+      const submission = await prisma.submission.findUnique({
+        where: { id: submissionId },
+        select: {
+          submissionNumber: true,
+          homeownerName: true,
+          propertyAddress: true,
+          city: true,
+          provinceState: true,
+          postalZip: true,
+        }
+      });
+
+      if (submission) {
+        const fullAddress = [
+          submission.propertyAddress,
+          submission.city,
+          submission.provinceState,
+          submission.postalZip
+        ].filter(Boolean).join(', ');
+
+        await sendNotificationEmail({
+          notificationId: process.env.NOTIF_ID_AUTO_ENHANCE_COMPLETE || '',
+          recipientEmail: 'dan@retreatvr.ca',
+          subject: `✅ Enhancements Ready - #${submission.submissionNumber} (${successCount}/${photos.length} photos)`,
+          body: generateAutoEnhanceCompleteEmail({
+            submissionNumber: submission.submissionNumber,
+            homeownerName: submission.homeownerName,
+            propertyAddress: fullAddress,
+            totalPhotos: photos.length,
+            successCount,
+            errorCount
+          })
+        });
+        console.log('[AUTO-ENHANCE] Admin notification email sent');
+      }
+    } catch (emailError) {
+      console.error('[AUTO-ENHANCE] Failed to send notification email:', emailError);
+      // Don't fail the whole response if email fails
+    }
+
+    // Also update submission status to "In Progress" since enhancements are done
+    try {
+      await prisma.submission.update({
+        where: { id: submissionId },
+        data: { status: 'In Progress' }
+      });
+    } catch (statusError) {
+      console.error('[AUTO-ENHANCE] Failed to update submission status:', statusError);
+    }
+
+    return NextResponse.json({
+      status: 'completed',
+      total: photos.length,
+      success: successCount,
+      errors: errorCount
+    });
+```
+
+---
+
+### CHANGE 3: Add environment variable for the notification ID
+
+Add this to your `.env` file (or set it in the Abacus AI environment variables):
+
+```
+NOTIF_ID_AUTO_ENHANCE_COMPLETE=auto_enhance_complete
+```
+
+If you don't have notification IDs configured, the email will still attempt to send with an empty string — Abacus AI's notification system may still deliver it depending on your setup. Check that `NOTIF_ID_SUBMISSION_CONFIRMATION` and `NOTIF_ID_NEW_SUBMISSION_ALERT` are working; this new one uses the same mechanism.
+
+---
+
+### SUMMARY
+
+| # | File | What Changed |
+|---|---|---|
+| 1 | `/lib/email.ts` | Added `generateAutoEnhanceCompleteEmail` template — shows submission details, success/error counts, default settings used, and a direct link to the admin dashboard |
+| 2 | `/app/api/submissions/[id]/auto-enhance/route.ts` | Sends admin email after all photos are processed, also auto-updates submission status to "In Progress" |
+| 3 | `.env` | New `NOTIF_ID_AUTO_ENHANCE_COMPLETE` variable |
+
+### FLOW AFTER THIS CHANGE
+
+1. Homeowner submits photos
+2. System sends confirmation email to homeowner ✅ (existing)
+3. System sends "New Submission" alert to admin ✅ (existing)
+4. Auto-enhancement starts in background, processing each photo with **Moderate intensity, room-specific editing prompts, no toggles, no creative additions**
+5. After all photos are done → **NEW: Sends "Enhancements Ready" email to admin** with success/error count and link to dashboard
+6. Submission status auto-updates to "In Progress"
+7. Admin clicks link, reviews enhancements, re-runs any that need adjustment with different settings/toggles/prompts
